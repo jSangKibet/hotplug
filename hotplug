@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# hotplug - limit active cores and manage frequency on Intel hybrid CPUs
+set -euo pipefail
+
+CPU=/sys/devices/system/cpu
+P_KEEP=${P_KEEP:-2}
+E_KEEP=${E_KEEP:-4}
+RECIPE_DIR=${HOTPLUG_RECIPES:-$(dirname "$(readlink -f "$0")")/recipes}
+
+die() { echo "$*" >&2; exit 1; }
+
+need_root() {
+  [[ $EUID -eq 0 ]] || die "This command needs root (use sudo)."
+}
+
+# Expand "0-15,20,22-23" into one number per line
+expand() {
+  local part parts
+  IFS=',' read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    if [[ $part == *-* ]]; then
+      seq "${part%-*}" "${part#*-}"
+    else
+      echo "$part"
+    fi
+  done
+}
+
+set_online() {   # usage: set_online <cpu number> <0|1>
+  local f="$CPU/cpu$1/online"
+  [[ -w $f ]] && echo "$2" > "$f"
+  return 0
+}
+
+online_all() {
+  local c
+  for c in "$CPU"/cpu[0-9]*; do
+    set_online "${c##*cpu}" 1
+  done
+}
+
+limit_cores() {   # usage: limit_cores <P-cores to keep> <E-cores to keep>
+  local p=$1 e=$2
+  [[ -r /sys/devices/cpu_core/cpus && -r /sys/devices/cpu_atom/cpus ]] \
+    || die "No hybrid CPU topology found."
+
+  online_all
+
+  local pcpus ecpus
+  pcpus=$(expand "$(cat /sys/devices/cpu_core/cpus)")
+  ecpus=$(expand "$(cat /sys/devices/cpu_atom/cpus)")
+
+  declare -A keep seen
+  local cpu key n=0
+
+  for cpu in $pcpus; do
+    key=$(cat "$CPU/cpu$cpu/topology/thread_siblings_list")
+    if [[ -z ${seen[$key]:-} ]]; then
+      (( n < p )) || continue
+      seen[$key]=1
+      n=$((n + 1))
+    fi
+    keep[$cpu]=1
+  done
+
+  n=0
+  for cpu in $ecpus; do
+    (( n < e )) || break
+    keep[$cpu]=1
+    n=$((n + 1))
+  done
+
+  keep[0]=1
+  for cpu in $pcpus $ecpus; do
+    [[ -n ${keep[$cpu]:-} ]] || set_online "$cpu" 0
+  done
+}
+
+declare -A R=()
+
+load_recipe() {   # usage: load_recipe <file>
+  local file=$1 line key val
+  R=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%%#*}
+    line=${line//[[:space:]\"\']/}
+    [[ -z $line ]] && continue
+    [[ $line =~ ^([A-Z_0-9]+)=(.*)$ ]] || die "Bad line in $file: $line"
+    key=${BASH_REMATCH[1]}
+    val=${BASH_REMATCH[2]}
+    case $key in
+      P_CORES|E_CORES)
+        [[ $val =~ ^[0-9]+$ ]] || die "$key must be a number in $file (got '$val')." ;;
+      *) die "Unknown key '$key' in $file." ;;
+    esac
+    R[$key]=$val
+  done < "$file"
+}
+
+find_recipe() {   # usage: find_recipe <name or path>
+  local name=$1
+  if [[ -f $name ]]; then
+    echo "$name"
+  elif [[ -f $RECIPE_DIR/$name.conf ]]; then
+    echo "$RECIPE_DIR/$name.conf"
+  else
+    die "Recipe '$name' not found (looked in $RECIPE_DIR)."
+  fi
+}
+
+cmd_apply() {   # usage: cmd_apply <recipe>
+  need_root
+  [[ -n ${1:-} ]] || die "Usage: hotplug apply <recipe>"
+  local file
+  file=$(find_recipe "$1")
+  load_recipe "$file"
+  limit_cores "${R[P_CORES]:-999}" "${R[E_CORES]:-999}"
+  echo "Applied recipe: $file"
+  echo "Active CPUs: $(cat $CPU/online)"
+}
+
+cmd_limit() {   # usage: cmd_limit [P E]
+  need_root
+  limit_cores "${1:-$P_KEEP}" "${2:-$E_KEEP}"
+  echo "Active CPUs: $(cat $CPU/online)"
+}
+
+cmd_restore() {
+  need_root
+  online_all
+  echo "All CPUs online: $(cat $CPU/online)"
+}
+
+cmd_recipes() {
+  local f found=0
+  for f in "$RECIPE_DIR"/*.conf; do
+    [[ -f $f ]] || continue
+    echo "  $(basename "$f" .conf)"
+    found=1
+  done
+  (( found )) || echo "No recipes in $RECIPE_DIR"
+}
+
+cmd_status() {
+  lscpu -e=CORE,CPU,MAXMHZ
+}
+
+usage() {
+  cat <<USAGE
+Usage: sudo $(basename "$0") <command>
+
+  apply <recipe>   Apply a recipe: a name from $RECIPE_DIR
+                   (e.g. "work" -> work.conf) or a path to a file
+  recipes          List available recipes
+  limit [P E]      Keep P performance cores and E efficiency cores
+                   (default: $P_KEEP and $E_KEEP)
+  restore          Bring every core back online
+  status           Show core, CPU and max MHz (no root needed)
+
+CPU 0 can't be taken offline on stock kernels, so it is always kept.
+USAGE
+}
+
+main() {
+  case ${1:-} in
+    apply)   shift; cmd_apply "$@" ;;
+    recipes) cmd_recipes ;;
+    limit)   shift; cmd_limit "$@" ;;
+    restore) cmd_restore ;;
+    status)  cmd_status ;;
+    *)       usage ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
